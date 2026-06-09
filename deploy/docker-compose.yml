@@ -1,0 +1,52 @@
+name: api-hub
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: apihub
+      POSTGRES_PASSWORD: apihub
+      POSTGRES_DB: apihub
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apihub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  etcd:
+    image: bitnami/etcd:3.5
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
+      ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    ports:
+      - "2379:2379"
+
+  apisix:
+    image: apache/apisix:3.9.1-debian
+    depends_on:
+      - etcd
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+    ports:
+      - "9080:9080"   # 数据面（中继入口）
+      - "9180:9180"   # Admin API
+
+  frps:
+    image: snowdreamtech/frps:latest
+    volumes:
+      - ./frps/frps.toml:/etc/frp/frps.toml:ro
+    network_mode: host   # 需要开放 7000 + 40000-49999 端口段
+
+volumes:
+  pgdata:

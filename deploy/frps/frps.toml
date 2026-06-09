@@ -1,0 +1,20 @@
+# frps · 平台侧穿透入口
+# 文档: https://gofrp.org/
+
+bindPort = 7000
+
+# 鉴权 token，需与控制面 FRP_TOKEN 一致
+auth.method = "token"
+auth.token = "CHANGE_ME_FRP_TOKEN"
+
+# 允许的远程端口区间，必须与控制面端口分配器(FRP_PORT_MIN/MAX)一致
+allowPorts = [{ start = 40000, end = 49999 }]
+
+# frps 管理面板
+webServer.addr = "0.0.0.0"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "CHANGE_ME_ADMIN_PWD"
+
+# 心跳
+transport.heartbeatTimeout = 90

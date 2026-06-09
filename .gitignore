@@ -1,0 +1,16 @@
+# Go
+/server/server
+/agent/agent
+*.test
+
+# Node
+node_modules/
+dist/
+web/vite.config.ts.timestamp-*
+
+# Agent 生成的 frpc 配置
+frpc.generated.toml
+
+# 环境
+.env
+.DS_Store

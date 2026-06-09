@@ -1,0 +1,31 @@
+# APISIX 数据面网关配置（最小可用）
+# 控制面通过 Admin API (admin_key) 下发 route / upstream / consumer
+
+apisix:
+  node_listen: 9080
+  enable_admin: true
+  admin_key:
+    - name: admin
+      key: CHANGE_ME_APISIX_ADMIN_KEY
+      role: admin
+
+deployment:
+  role: traditional
+  role_traditional:
+    config_provider: etcd
+  admin:
+    allow_admin:
+      - 0.0.0.0/0
+  etcd:
+    host:
+      - "http://etcd:2379"
+    prefix: /apisix
+    timeout: 30
+
+plugins:
+  - key-auth
+  - jwt-auth
+  - limit-count
+  - limit-req
+  - proxy-rewrite
+  - prometheus
