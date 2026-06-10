@@ -529,15 +529,10 @@ func (h *Handler) ingestAccess(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	// APISIX http-logger 既可能批量推送对象数组，也可能在 batch_max_size=1 时推送单个对象，两者都要兼容。
-	var entries []apisixLogEntry
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		var one apisixLogEntry
-		if err2 := json.Unmarshal(raw, &one); err2 != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
-		entries = []apisixLogEntry{one}
+	entries, err := parseAccessLogPayload(raw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
 	}
 	logs := make([]model.AccessLogEntry, 0, len(entries))
 	for _, e := range entries {

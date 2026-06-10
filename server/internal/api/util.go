@@ -3,9 +3,25 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
+
+// parseAccessLogPayload 解析 APISIX http-logger 推送的访问日志。
+// APISIX 既可能批量推送对象数组（batch_max_size>1），也可能推送单个对象（batch_max_size=1），两者都要兼容。
+func parseAccessLogPayload(raw []byte) ([]apisixLogEntry, error) {
+	var entries []apisixLogEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		var one apisixLogEntry
+		if err2 := json.Unmarshal(raw, &one); err2 != nil {
+			// 返回数组解析的错误，对调用方更直观。
+			return nil, err
+		}
+		entries = []apisixLogEntry{one}
+	}
+	return entries, nil
+}
 
 // newAPIKey 生成消费方 API Key。
 func newAPIKey() string {

@@ -192,7 +192,32 @@ cd deploy && docker compose down -v
 
 ---
 
-## 7. 已知注意事项
+## 7. 运行测试
+
+Go 测试分两类：
+
+- **离线单元测试**：无需任何外部依赖，直接跑。覆盖 APISIX 路由/消费方下发（`apisix`）、frp 端口分配（`frpalloc`，用内存版 redis）、工具函数与访问日志解析（`api`）、Agent 的 OpenAPI 解析。
+
+  ```bash
+  cd server && go test ./...
+  cd ../agent && go test ./...
+  ```
+
+- **store 集成测试**：需要真实 PG + Redis，默认**跳过**；配置环境变量后才运行。
+
+  ```bash
+  cd deploy && docker compose up -d postgres redis     # 起依赖（镜像小、快）
+  cd ../server
+  APIHUB_TEST_PG_DSN="postgres://apihub:apihub@localhost:5432/apihub?sslmode=disable" \
+  APIHUB_TEST_REDIS="localhost:6379" \
+  go test ./internal/store/ -v
+  ```
+
+  > 集成测试会在每个用例开始时 `TRUNCATE` 相关表并 `FLUSHDB`，请只对**专用测试库**运行。
+
+看覆盖率加 `-cover`。
+
+## 8. 已知注意事项
 
 - **监控页要有数据**：必须给控制面配置 `LOG_INGEST_URI`（APISIX 可达的 `/api/v1/ingest/access` 地址），网关才会把访问日志推回控制面落库；否则 `/stats/calls` 为空。
 - **etcd 镜像**：`bitnami/etcd:3.5` 已在 Docker Hub 下架，compose 使用 `quay.io/coreos/etcd:v3.5.21`。

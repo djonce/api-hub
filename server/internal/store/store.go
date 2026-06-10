@@ -62,6 +62,10 @@ func (s *Store) UpsertService(ctx context.Context, rs model.RegisterService) (in
 	if rs.HealthPath == "" {
 		rs.HealthPath = "/health"
 	}
+	if rs.Tags == nil {
+		// tags 列为 NOT NULL；请求未带 tags 时用空数组，避免写入 NULL 报错。
+		rs.Tags = []string{}
+	}
 	var id int64
 	err := s.pg.QueryRow(ctx, `
 		INSERT INTO service (name, version, env, owner, tags, conn_mode, health_path, updated_at)

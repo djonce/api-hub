@@ -182,23 +182,30 @@ func fetchOpenAPI(url string) ([]regAPI, []byte, error) {
 }
 
 // parseOpenAPI 解析 OpenAPI 3.x 的 paths 段。
+// 路径条目里除 HTTP 方法外还可能有 parameters/description/$ref 等同级字段（OpenAPI 合法），
+// 故按 RawMessage 逐操作解析，跳过非方法键，避免个别字段导致整篇解析失败。
 func parseOpenAPI(body []byte) ([]regAPI, error) {
 	var doc struct {
-		Paths map[string]map[string]struct {
-			Summary string   `json:"summary"`
-			Tags    []string `json:"tags"`
-			Security []any   `json:"security"`
-		} `json:"paths"`
+		Paths map[string]map[string]json.RawMessage `json:"paths"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, err
 	}
+	type operation struct {
+		Summary  string   `json:"summary"`
+		Tags     []string `json:"tags"`
+		Security []any    `json:"security"`
+	}
 	var out []regAPI
 	methods := map[string]bool{"get": true, "post": true, "put": true, "patch": true, "delete": true}
 	for path, ops := range doc.Paths {
-		for method, op := range ops {
+		for method, raw := range ops {
 			if !methods[strings.ToLower(method)] {
-				continue
+				continue // 跳过 parameters / description / $ref 等非操作字段
+			}
+			var op operation
+			if err := json.Unmarshal(raw, &op); err != nil {
+				continue // 单个操作解析失败不影响其他接口
 			}
 			grp := ""
 			if len(op.Tags) > 0 {

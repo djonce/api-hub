@@ -1,6 +1,7 @@
 # Go
 /server/server
 /agent/agent
+/examples/demo-service/demo-service
 *.test
 
 # Node
