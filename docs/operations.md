@@ -217,7 +217,33 @@ Go 测试分两类：
 
 看覆盖率加 `-cover`。
 
-## 8. 已知注意事项
+## 8. 国内镜像加速（Docker 全量构建慢/拉取超时时）
+
+国内直连 Docker Hub 拉 `golang`/`node`/`alpine`/`nginx` 基础镜像可能被限速到不可用。三处分别走国内源即可让 `docker compose up --build` 顺畅跑通：
+
+1. **基础镜像 → 配置 Docker registry 镜像源**（机器级，不在仓库里）。编辑 `~/.docker/daemon.json` 加入 `registry-mirrors`，然后**重启 Docker**：
+
+   ```json
+   {
+     "registry-mirrors": [
+       "https://docker.m.daocloud.io",
+       "https://docker.1panel.live",
+       "https://hub.rat.dev",
+       "https://docker.1ms.run"
+     ]
+   }
+   ```
+
+   > 公共镜像源时有失效，可换其它可用源；`docker info | grep -A5 'Registry Mirrors'` 确认生效。
+   > macOS 改完需在 Docker Desktop 里**完全退出再启动**（仅点 Restart 有时不重载 daemon.json）。
+
+2. **Go 模块 → `GOPROXY`**：各 Go 服务的 `Dockerfile` 已内置 `ARG GOPROXY=https://goproxy.cn,direct`（`direct` 兜底保证海外仍可用）。需要改回官方：`docker compose build --build-arg GOPROXY=https://proxy.golang.org,direct`。
+
+3. **npm 依赖 → `NPM_REGISTRY`**：`web/Dockerfile` 已内置 `ARG NPM_REGISTRY=https://registry.npmmirror.com`。改回官方：`--build-arg NPM_REGISTRY=https://registry.npmjs.org`。
+
+> 配好镜像源后，全量构建（含编译 Go 三个服务 + 构建前端 + 拉 PG/Redis/etcd/APISIX）几分钟内即可完成，`python3 e2e.py` 应全绿。
+
+## 9. 已知注意事项
 
 - **监控页要有数据**：必须给控制面配置 `LOG_INGEST_URI`（APISIX 可达的 `/api/v1/ingest/access` 地址），网关才会把访问日志推回控制面落库；否则 `/stats/calls` 为空。
 - **etcd 镜像**：`bitnami/etcd:3.5` 已在 Docker Hub 下架，compose 使用 `quay.io/coreos/etcd:v3.5.21`。
