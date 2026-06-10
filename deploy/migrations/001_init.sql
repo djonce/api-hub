@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS service (
   conn_mode     TEXT NOT NULL DEFAULT 'relay',     -- direct / relay
   health_path   TEXT NOT NULL DEFAULT '/health',
   status        TEXT NOT NULL DEFAULT 'enabled',   -- enabled / disabled
+  openapi_spec  JSONB,                             -- 服务上报的完整 OpenAPI 文档
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (name, version, env)

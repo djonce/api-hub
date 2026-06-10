@@ -74,6 +74,26 @@ func (s *Store) UpsertService(ctx context.Context, rs model.RegisterService) (in
 	return id, err
 }
 
+// SetOpenAPI 保存服务上报的完整 OpenAPI 文档。
+func (s *Store) SetOpenAPI(ctx context.Context, serviceID int64, spec []byte) error {
+	if len(spec) == 0 {
+		return nil
+	}
+	_, err := s.pg.Exec(ctx,
+		`UPDATE service SET openapi_spec=$2, updated_at=now() WHERE id=$1`, serviceID, spec)
+	return err
+}
+
+// GetOpenAPI 返回服务的 OpenAPI 文档（无则返回 nil）。
+func (s *Store) GetOpenAPI(ctx context.Context, serviceID int64) ([]byte, error) {
+	var spec []byte
+	err := s.pg.QueryRow(ctx, `SELECT openapi_spec FROM service WHERE id=$1`, serviceID).Scan(&spec)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return spec, err
+}
+
 // UpsertInstance 写入/更新实例连接信息。
 func (s *Store) UpsertInstance(ctx context.Context, in model.Instance) (int64, error) {
 	var id int64
@@ -159,6 +179,19 @@ func (s *Store) OnlineCount(ctx context.Context, serviceID int64) int {
 	return int(n)
 }
 
+// OnlineUIDs 返回当前在线实例 uid 集合。
+func (s *Store) OnlineUIDs(ctx context.Context, serviceID int64) map[string]bool {
+	key := onlineKey(serviceID)
+	now := fmt.Sprintf("%d", time.Now().Unix())
+	s.rdb.ZRemRangeByScore(ctx, key, "0", now)
+	uids, _ := s.rdb.ZRange(ctx, key, 0, -1).Result()
+	m := make(map[string]bool, len(uids))
+	for _, u := range uids {
+		m[u] = true
+	}
+	return m
+}
+
 // ---------- 查询（控制台用）----------
 
 func (s *Store) ListServices(ctx context.Context) ([]model.Service, error) {
@@ -218,7 +251,7 @@ func (s *Store) ListInstances(ctx context.Context, serviceID int64) ([]model.Ins
 
 func (s *Store) ListAPIs(ctx context.Context, serviceID int64) ([]model.API, error) {
 	rows, err := s.pg.Query(ctx, `
-		SELECT id,service_id,path,method,summary,grp,req_schema,resp_schema,auth_required,rate_limit,conn_mode,status,source
+		SELECT id,service_id,path,method,summary,grp,req_schema,resp_schema,auth_required,rate_limit,conn_mode,breaker_enabled,status,source
 		FROM api WHERE service_id=$1 ORDER BY path, method`, serviceID)
 	if err != nil {
 		return nil, err
@@ -229,7 +262,7 @@ func (s *Store) ListAPIs(ctx context.Context, serviceID int64) ([]model.API, err
 		var a model.API
 		if err := rows.Scan(&a.ID, &a.ServiceID, &a.Path, &a.Method, &a.Summary, &a.Group,
 			&a.ReqSchema, &a.RespSchema, &a.AuthRequired, &a.RateLimit, &a.ConnMode,
-			&a.Status, &a.Source); err != nil {
+			&a.BreakerEnabled, &a.Status, &a.Source); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -240,9 +273,9 @@ func (s *Store) ListAPIs(ctx context.Context, serviceID int64) ([]model.API, err
 func (s *Store) GetAPI(ctx context.Context, id int64) (*model.API, error) {
 	var a model.API
 	err := s.pg.QueryRow(ctx, `
-		SELECT id,service_id,path,method,summary,grp,req_schema,resp_schema,auth_required,rate_limit,conn_mode,status,source
+		SELECT id,service_id,path,method,summary,grp,req_schema,resp_schema,auth_required,rate_limit,conn_mode,breaker_enabled,status,source
 		FROM api WHERE id=$1`, id).Scan(&a.ID, &a.ServiceID, &a.Path, &a.Method, &a.Summary, &a.Group,
-		&a.ReqSchema, &a.RespSchema, &a.AuthRequired, &a.RateLimit, &a.ConnMode, &a.Status, &a.Source)
+		&a.ReqSchema, &a.RespSchema, &a.AuthRequired, &a.RateLimit, &a.ConnMode, &a.BreakerEnabled, &a.Status, &a.Source)
 	if err != nil {
 		return nil, err
 	}
@@ -251,19 +284,21 @@ func (s *Store) GetAPI(ctx context.Context, id int64) (*model.API, error) {
 
 // APIPatch 控制台可改字段（nil 表示不改）。
 type APIPatch struct {
-	Status    *string `json:"status"`
-	ConnMode  *string `json:"conn_mode"`
-	RateLimit *int    `json:"rate_limit"`
+	Status         *string `json:"status"`
+	ConnMode       *string `json:"conn_mode"`
+	RateLimit      *int    `json:"rate_limit"`
+	BreakerEnabled *bool   `json:"breaker_enabled"`
 }
 
 func (s *Store) UpdateAPI(ctx context.Context, id int64, p APIPatch) error {
 	_, err := s.pg.Exec(ctx, `
 		UPDATE api SET
-		  status     = COALESCE($2, status),
-		  conn_mode  = CASE WHEN $3::text IS NOT NULL THEN $3 ELSE conn_mode END,
-		  rate_limit = COALESCE($4, rate_limit),
-		  updated_at = now()
-		WHERE id=$1`, id, p.Status, p.ConnMode, p.RateLimit)
+		  status          = COALESCE($2, status),
+		  conn_mode       = CASE WHEN $3::text IS NOT NULL THEN $3 ELSE conn_mode END,
+		  rate_limit      = COALESCE($4, rate_limit),
+		  breaker_enabled = COALESCE($5, breaker_enabled),
+		  updated_at      = now()
+		WHERE id=$1`, id, p.Status, p.ConnMode, p.RateLimit, p.BreakerEnabled)
 	return err
 }
 
@@ -284,6 +319,17 @@ func (s *Store) ListConsumers(ctx context.Context) ([]model.Consumer, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) GetConsumer(ctx context.Context, id int64) (*model.Consumer, error) {
+	var c model.Consumer
+	err := s.pg.QueryRow(ctx,
+		`SELECT id,name,description,created_at FROM consumer WHERE id=$1`, id).
+		Scan(&c.ID, &c.Name, &c.Description, &c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 func (s *Store) CreateConsumer(ctx context.Context, name, desc string) (*model.Consumer, error) {
@@ -326,4 +372,125 @@ func (s *Store) StatsOverview(ctx context.Context) (Overview, error) {
 		}
 	}
 	return o, nil
+}
+
+// ---------- 三期：访问日志 / 审计 / 调用统计 ----------
+
+func (s *Store) InsertAccessLogs(ctx context.Context, entries []model.AccessLogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, e := range entries {
+		var sid, aid any // 0 -> NULL
+		if e.ServiceID > 0 {
+			sid = e.ServiceID
+		}
+		if e.APIID > 0 {
+			aid = e.APIID
+		}
+		batch.Queue(`INSERT INTO access_log (service_id, api_id, api_path, method, status, latency_ms, consumer)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			sid, aid, e.APIPath, e.Method, e.Status, e.LatencyMS, e.Consumer)
+	}
+	br := s.pg.SendBatch(ctx, batch)
+	defer br.Close()
+	for range entries {
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) InsertAudit(ctx context.Context, action, target, detail string) {
+	_, _ = s.pg.Exec(ctx, `INSERT INTO audit_log (action, target, detail) VALUES ($1,$2,$3)`, action, target, detail)
+}
+
+func (s *Store) ListAudit(ctx context.Context, limit int) ([]model.AuditEntry, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.pg.Query(ctx, `SELECT id,action,target,detail,ts FROM audit_log ORDER BY id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.AuditEntry{}
+	for rows.Next() {
+		var a model.AuditEntry
+		if err := rows.Scan(&a.ID, &a.Action, &a.Target, &a.Detail, &a.TS); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+type SeriesPoint struct {
+	T     string `json:"t"`
+	Count int    `json:"count"`
+}
+type StatusCount struct {
+	Status int `json:"status"`
+	Count  int `json:"count"`
+}
+type PathCount struct {
+	Path  string `json:"path"`
+	Count int    `json:"count"`
+}
+type CallStats struct {
+	Total    int           `json:"total"`
+	Success  int           `json:"success"`
+	Error    int           `json:"error"`
+	Series   []SeriesPoint `json:"series"`
+	ByStatus []StatusCount `json:"by_status"`
+	TopAPIs  []PathCount   `json:"top_apis"`
+}
+
+// CallStats 聚合访问日志。serviceID=0 表示全部服务。
+func (s *Store) CallStats(ctx context.Context, serviceID int64, since time.Time) (CallStats, error) {
+	cs := CallStats{Series: []SeriesPoint{}, ByStatus: []StatusCount{}, TopAPIs: []PathCount{}}
+
+	_ = s.pg.QueryRow(ctx, `SELECT
+			count(*),
+			count(*) FILTER (WHERE status < 400),
+			count(*) FILTER (WHERE status >= 400)
+		FROM access_log WHERE ts >= $1 AND ($2 = 0 OR service_id = $2)`,
+		since, serviceID).Scan(&cs.Total, &cs.Success, &cs.Error)
+
+	if rows, err := s.pg.Query(ctx, `SELECT to_char(date_trunc('minute', ts),'MM-DD HH24:MI') t, count(*)
+		FROM access_log WHERE ts >= $1 AND ($2 = 0 OR service_id = $2)
+		GROUP BY date_trunc('minute', ts) ORDER BY date_trunc('minute', ts)`, since, serviceID); err == nil {
+		for rows.Next() {
+			var p SeriesPoint
+			if rows.Scan(&p.T, &p.Count) == nil {
+				cs.Series = append(cs.Series, p)
+			}
+		}
+		rows.Close()
+	}
+
+	if rows, err := s.pg.Query(ctx, `SELECT status, count(*) FROM access_log
+		WHERE ts >= $1 AND ($2 = 0 OR service_id = $2) GROUP BY status ORDER BY status`, since, serviceID); err == nil {
+		for rows.Next() {
+			var sc StatusCount
+			if rows.Scan(&sc.Status, &sc.Count) == nil {
+				cs.ByStatus = append(cs.ByStatus, sc)
+			}
+		}
+		rows.Close()
+	}
+
+	if rows, err := s.pg.Query(ctx, `SELECT api_path, count(*) c FROM access_log
+		WHERE ts >= $1 AND ($2 = 0 OR service_id = $2) GROUP BY api_path ORDER BY c DESC LIMIT 10`, since, serviceID); err == nil {
+		for rows.Next() {
+			var pc PathCount
+			if rows.Scan(&pc.Path, &pc.Count) == nil {
+				cs.TopAPIs = append(cs.TopAPIs, pc)
+			}
+		}
+		rows.Close()
+	}
+	return cs, nil
 }

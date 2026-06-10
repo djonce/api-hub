@@ -27,8 +27,22 @@ export interface Api {
   auth_required: boolean;
   rate_limit: number;
   conn_mode: string | null;
+  breaker_enabled: boolean;
   status: string;
   source: string;
+}
+
+export interface Instance {
+  id: number;
+  service_id: number;
+  instance_uid: string;
+  local_port: number;
+  frp_remote_port: number;
+  frp_proxy_name: string;
+  direct_url: string;
+  relay_upstream: string;
+  last_seen_at: string | null;
+  online: boolean;
 }
 
 export interface Consumer {
@@ -54,6 +68,42 @@ export interface Overview {
   consumers: number;
 }
 
+export interface AppConfig {
+  apisix_enabled: boolean;
+  gateway_url: string;
+}
+
+export interface SeriesPoint {
+  t: string;
+  count: number;
+}
+export interface StatusCount {
+  status: number;
+  count: number;
+}
+export interface PathCount {
+  path: string;
+  count: number;
+}
+export interface CallStats {
+  total: number;
+  success: number;
+  error: number;
+  series: SeriesPoint[];
+  by_status: StatusCount[];
+  top_apis: PathCount[];
+}
+export interface AuditEntry {
+  id: number;
+  action: string;
+  target: string;
+  detail: string;
+  ts: string;
+}
+
+// 浏览器直接访问的 OpenAPI 文档地址（供 Swagger UI 加载）
+export const openapiUrl = (serviceId: number) => `${BASE}/services/${serviceId}/openapi`;
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(BASE + path, {
     headers: { "Content-Type": "application/json" },
@@ -68,12 +118,21 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  config: () => req<AppConfig>("/config"),
   overview: () => req<Overview>("/stats/overview"),
+  callStats: (hours = 24, serviceId?: number) =>
+    req<CallStats>(`/stats/calls?hours=${hours}${serviceId ? `&service_id=${serviceId}` : ""}`),
+  audit: (limit = 200) => req<AuditEntry[]>(`/audit?limit=${limit}`),
   services: () => req<Service[]>("/services"),
   service: (id: number) => req<Service>(`/services/${id}`),
   serviceApis: (id: number) => req<Api[]>(`/services/${id}/apis`),
-  patchApi: (id: number, patch: Partial<Pick<Api, "status" | "conn_mode" | "rate_limit">>) =>
-    req<{ ok: boolean }>(`/apis/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  serviceInstances: (id: number) => req<Instance[]>(`/services/${id}/instances`),
+  patchApi: (
+    id: number,
+    patch: Partial<Pick<Api, "status" | "conn_mode" | "rate_limit" | "breaker_enabled">>
+  ) => req<{ ok: boolean }>(`/apis/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  syncService: (id: number) =>
+    req<{ ok: boolean }>(`/services/${id}/sync`, { method: "POST" }),
   consumers: () => req<Consumer[]>("/consumers"),
   createConsumer: (name: string, description: string) =>
     req<Consumer>("/consumers", { method: "POST", body: JSON.stringify({ name, description }) }),

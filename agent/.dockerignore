@@ -1,0 +1,5 @@
+Dockerfile
+.dockerignore
+agent
+frpc.generated.toml
+*.test

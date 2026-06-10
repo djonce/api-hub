@@ -38,7 +38,18 @@ export default function Consumers() {
       const k = await api.createKey(c.id, 0);
       Modal.success({
         title: `已为 ${c.name} 签发 API Key`,
-        content: <Typography.Text copyable>{k.api_key}</Typography.Text>,
+        width: 560,
+        content: (
+          <div>
+            <Typography.Paragraph>
+              <Typography.Text copyable>{k.api_key}</Typography.Text>
+            </Typography.Paragraph>
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+              中继模式调用时带请求头 <Typography.Text code>apikey: {k.api_key}</Typography.Text>
+              ；中继入口见各服务详情页的「中继入口」。
+            </Typography.Paragraph>
+          </div>
+        ),
       });
     } catch (e) {
       message.error(String(e));

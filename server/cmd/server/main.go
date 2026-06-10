@@ -40,7 +40,8 @@ func main() {
 	defer st.Close()
 
 	alloc := frpalloc.New(st.Redis(), atoi(env("FRP_PORT_MIN", "40000")), atoi(env("FRP_PORT_MAX", "49999")))
-	ax := apisix.New(env("APISIX_ADMIN", ""), env("APISIX_ADMIN_KEY", ""))
+	// LOG_INGEST_URI：APISIX 可访问到的控制面访问日志接收地址（http-logger 目标）。
+	ax := apisix.New(env("APISIX_ADMIN", ""), env("APISIX_ADMIN_KEY", ""), env("LOG_INGEST_URI", ""))
 
 	cfg := api.Config{
 		FRPServerAddr: env("FRP_SERVER_ADDR", "127.0.0.1"),
@@ -48,6 +49,7 @@ func main() {
 		FRPToken:      env("FRP_TOKEN", "CHANGE_ME_FRP_TOKEN"),
 		HeartbeatSec:  atoi(env("HEARTBEAT_SEC", "10")),
 		PublicHost:    env("PUBLIC_HOST", "127.0.0.1"),
+		GatewayURL:    env("APISIX_GATEWAY", "http://127.0.0.1:9080"),
 	}
 
 	h := api.New(st, alloc, ax, cfg)

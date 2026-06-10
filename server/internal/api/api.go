@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -21,6 +22,7 @@ type Config struct {
 	FRPToken      string
 	HeartbeatSec  int
 	PublicHost    string // 平台公网/可达主机，用于拼直连URL与中继上游
+	GatewayURL    string // APISIX 数据面对外地址，如 http://host:9080，用于拼中继入口
 }
 
 type Handler struct {
@@ -46,11 +48,21 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/services", h.listServices)
 	mux.HandleFunc("GET /api/v1/services/{id}", h.getService)
 	mux.HandleFunc("GET /api/v1/services/{id}/apis", h.listAPIs)
+	mux.HandleFunc("GET /api/v1/services/{id}/instances", h.listInstances)
+	mux.HandleFunc("GET /api/v1/services/{id}/openapi", h.getOpenAPI)
+	mux.HandleFunc("POST /api/v1/services/{id}/sync", h.syncService)
 	mux.HandleFunc("PATCH /api/v1/apis/{id}", h.patchAPI)
+	mux.HandleFunc("GET /api/v1/config", h.getConfig)
 	mux.HandleFunc("GET /api/v1/consumers", h.listConsumers)
 	mux.HandleFunc("POST /api/v1/consumers", h.createConsumer)
 	mux.HandleFunc("POST /api/v1/consumers/{id}/keys", h.createKey)
 	mux.HandleFunc("GET /api/v1/stats/overview", h.overview)
+
+	// 三期：监控 / 审计
+	mux.HandleFunc("GET /api/v1/stats/calls", h.callStats)
+	mux.HandleFunc("GET /api/v1/audit", h.listAudit)
+	// 数据面访问日志接入（APISIX http-logger 推送，内网调用）
+	mux.HandleFunc("POST /api/v1/ingest/access", h.ingestAccess)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
@@ -104,6 +116,11 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		DirectURL:     fmt.Sprintf("http://%s:%d", h.cfg.PublicHost, port),
 		RelayUpstream: fmt.Sprintf("%s:%d", h.cfg.PublicHost, port),
 	}
+	// 服务可直达时（advertise_host），直连/中继上游直接指向它，免 frp。
+	if ah := req.Instance.AdvertiseHost; ah != "" {
+		inst.DirectURL = fmt.Sprintf("http://%s:%d", ah, req.Instance.LocalPort)
+		inst.RelayUpstream = fmt.Sprintf("%s:%d", ah, req.Instance.LocalPort)
+	}
 	instID, err := h.st.UpsertInstance(ctx, inst)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -115,9 +132,17 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := h.st.SetOpenAPI(ctx, serviceID, req.OpenAPISpec); err != nil {
+		log.Printf("set openapi: %v", err)
+	}
+
 	if err := h.st.MarkOnline(ctx, serviceID, req.Instance.InstanceUID, h.ttl()); err != nil {
 		log.Printf("mark online: %v", err)
 	}
+
+	// 新实例上线后重发布该服务的中继路由（刷新上游节点）。
+	h.resyncService(ctx, serviceID)
+	h.st.InsertAudit(ctx, "service.register", req.Service.Name, req.Instance.InstanceUID)
 
 	writeJSON(w, http.StatusOK, model.RegisterResponse{
 		ServiceID:  serviceID,
@@ -157,6 +182,7 @@ func (h *Handler) deregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = h.st.Deregister(r.Context(), body.InstanceUID)
+	h.st.InsertAudit(r.Context(), "service.deregister", body.InstanceUID, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -197,6 +223,82 @@ func (h *Handler) listAPIs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, apis)
 }
 
+func (h *Handler) listInstances(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	insts, err := h.st.ListInstances(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	online := h.st.OnlineUIDs(ctx, id)
+	for i := range insts {
+		insts[i].Online = online[insts[i].InstanceUID]
+	}
+	writeJSON(w, http.StatusOK, insts)
+}
+
+// getOpenAPI 返回服务的 OpenAPI 文档，并把 servers 改写为在线实例的直连地址，
+// 使 Swagger UI 的 try-it-out 在直连模式下可直接调用。
+func (h *Handler) getOpenAPI(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	spec, err := h.st.GetOpenAPI(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if len(spec) == 0 {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("该服务暂未上报 OpenAPI 文档"))
+		return
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(spec, &doc); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+	servers := []map[string]string{}
+	if base := h.pickBaseURL(ctx, id); base != "" {
+		servers = append(servers, map[string]string{"url": base, "description": "直连"})
+	}
+	if h.ax.Enabled() && h.cfg.GatewayURL != "" {
+		servers = append(servers, map[string]string{
+			"url":         h.cfg.GatewayURL + apisix.RelayPrefix(id),
+			"description": "中继（经平台网关，需 apikey 请求头）",
+		})
+	}
+	if len(servers) > 0 {
+		doc["servers"] = servers
+	}
+	// 注入 apikey 安全方案，便于在 Swagger UI 中调试中继接口。
+	ensureAPIKeyScheme(doc)
+	writeJSON(w, http.StatusOK, doc)
+}
+
+// pickBaseURL 优先取在线实例的直连地址，否则取任一实例。
+func (h *Handler) pickBaseURL(ctx context.Context, serviceID int64) string {
+	insts, err := h.st.ListInstances(ctx, serviceID)
+	if err != nil || len(insts) == 0 {
+		return ""
+	}
+	online := h.st.OnlineUIDs(ctx, serviceID)
+	for _, in := range insts {
+		if online[in.InstanceUID] && in.DirectURL != "" {
+			return in.DirectURL
+		}
+	}
+	return insts[0].DirectURL
+}
+
 func (h *Handler) patchAPI(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -212,44 +314,84 @@ func (h *Handler) patchAPI(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 二期：上线+中继 -> 同步 APISIX 路由；下线 -> 删除路由。
-	h.syncRoute(ctx, id)
+	detail, _ := json.Marshal(p)
+	h.st.InsertAudit(ctx, "api.update", "api:"+strconv.FormatInt(id, 10), string(detail))
+	// 上线+中继 -> 同步 APISIX 路由；下线/直连 -> 删除路由。
+	h.syncAPI(ctx, id)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// syncRoute 将接口状态同步到 APISIX（未配置 APISIX 时为 no-op）。
-func (h *Handler) syncRoute(ctx context.Context, apiID int64) {
+// syncService 手动重发布某服务的全部中继路由。
+func (h *Handler) syncService(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	h.resyncService(r.Context(), id)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// resyncService 遍历服务下所有接口并同步到 APISIX。
+func (h *Handler) resyncService(ctx context.Context, serviceID int64) {
+	if !h.ax.Enabled() {
+		return
+	}
+	apis, err := h.st.ListAPIs(ctx, serviceID)
+	if err != nil {
+		log.Printf("resync list apis: %v", err)
+		return
+	}
+	for _, a := range apis {
+		h.syncAPI(ctx, a.ID)
+	}
+}
+
+// relayNodes 收集该服务全部在线实例的中继上游，作为 APISIX upstream 节点。
+func (h *Handler) relayNodes(ctx context.Context, serviceID int64) map[string]int {
+	insts, err := h.st.ListInstances(ctx, serviceID)
+	if err != nil {
+		return nil
+	}
+	online := h.st.OnlineUIDs(ctx, serviceID)
+	nodes := map[string]int{}
+	for _, in := range insts {
+		if online[in.InstanceUID] && in.RelayUpstream != "" {
+			nodes[in.RelayUpstream] = 1
+		}
+	}
+	return nodes
+}
+
+// effectiveMode 计算接口的有效调用模式（接口覆盖优先，否则继承服务）。
+func effectiveMode(svcMode string, apiMode *string) string {
+	if apiMode != nil && *apiMode != "" {
+		return *apiMode
+	}
+	return svcMode
+}
+
+// syncAPI 将单个接口状态同步到 APISIX（未配置 APISIX 时为 no-op）。
+func (h *Handler) syncAPI(ctx context.Context, apiID int64) {
 	if !h.ax.Enabled() {
 		return
 	}
 	a, err := h.st.GetAPI(ctx, apiID)
 	if err != nil {
-		log.Printf("syncRoute get api: %v", err)
+		log.Printf("syncAPI get api: %v", err)
 		return
 	}
 	routeID := strconv.FormatInt(a.ID, 10)
-	if a.Status != "enabled" {
-		_ = h.ax.DeleteRoute(ctx, routeID)
-		return
-	}
 	svc, err := h.st.GetService(ctx, a.ServiceID)
 	if err != nil {
 		return
 	}
-	mode := svc.ConnMode
-	if a.ConnMode != nil && *a.ConnMode != "" {
-		mode = *a.ConnMode
-	}
-	if mode != "relay" {
-		_ = h.ax.DeleteRoute(ctx, routeID) // 直连模式不经网关
+	// 下线、或直连模式：网关上不应存在该路由。
+	if a.Status != "enabled" || effectiveMode(svc.ConnMode, a.ConnMode) != "relay" {
+		_ = h.ax.DeleteRoute(ctx, routeID)
 		return
 	}
-	// MVP：取该服务任一在线实例的上游（多实例负载均衡留待三期）。
-	insts, err := h.st.ListInstances(ctx, a.ServiceID)
-	if err != nil || len(insts) == 0 {
-		return
-	}
-	if err := h.ax.UpsertRoute(ctx, routeID, a.Method, a.Path, insts[0].RelayUpstream, a.AuthRequired, a.RateLimit); err != nil {
+	nodes := h.relayNodes(ctx, a.ServiceID)
+	if err := h.ax.UpsertRoute(ctx, routeID, a.ServiceID, a.Method, a.Path, nodes, a.AuthRequired, a.RateLimit, a.BreakerEnabled); err != nil {
 		log.Printf("apisix upsert route: %v", err)
 	}
 }
@@ -277,6 +419,7 @@ func (h *Handler) createConsumer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	h.st.InsertAudit(r.Context(), "consumer.create", c.Name, "")
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -289,13 +432,32 @@ func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 		QuotaPerMin int `json:"quota_per_min"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	ctx := r.Context()
 	key := newAPIKey()
-	k, err := h.st.CreateKey(r.Context(), id, key, body.QuotaPerMin)
+	k, err := h.st.CreateKey(ctx, id, key, body.QuotaPerMin)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 同步为 APISIX consumer（key-auth 凭据 + 配额），使 Key 在中继网关生效。
+	if h.ax.Enabled() {
+		if c, e := h.st.GetConsumer(ctx, id); e == nil {
+			uname := apisixUsername(c.Name, k.ID)
+			if e := h.ax.UpsertConsumer(ctx, uname, k.APIKey, k.QuotaPerMin); e != nil {
+				log.Printf("apisix upsert consumer: %v", e)
+			}
+		}
+	}
+	h.st.InsertAudit(ctx, "key.issue", "consumer:"+strconv.FormatInt(id, 10), "")
 	writeJSON(w, http.StatusOK, k)
+}
+
+// getConfig 返回前端需要的运行配置（中继入口、是否启用网关）。
+func (h *Handler) getConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"apisix_enabled": h.ax.Enabled(),
+		"gateway_url":    h.cfg.GatewayURL,
+	})
 }
 
 func (h *Handler) overview(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +467,101 @@ func (h *Handler) overview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, o)
+}
+
+// ---------- 三期：监控 / 审计 / 日志接入 ----------
+
+func (h *Handler) callStats(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var sid int64
+	if v := q.Get("service_id"); v != "" {
+		sid, _ = strconv.ParseInt(v, 10, 64)
+	}
+	hours := 24
+	if v := q.Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	since := time.Now().Add(-time.Duration(hours) * time.Hour)
+	cs, err := h.st.CallStats(r.Context(), sid, since)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cs)
+}
+
+func (h *Handler) listAudit(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	a, err := h.st.ListAudit(r.Context(), limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+// apisixLogEntry 对应 APISIX http-logger 默认日志对象的关注子集。
+type apisixLogEntry struct {
+	RouteID  string  `json:"route_id"`
+	Latency  float64 `json:"latency"`
+	Consumer string  `json:"consumer"`
+	Request  struct {
+		URI    string `json:"uri"`
+		Method string `json:"method"`
+	} `json:"request"`
+	Response struct {
+		Status int `json:"status"`
+	} `json:"response"`
+}
+
+// ingestAccess 接收 APISIX http-logger 推送的访问日志（JSON 数组），落库供统计。
+func (h *Handler) ingestAccess(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// APISIX http-logger 既可能批量推送对象数组，也可能在 batch_max_size=1 时推送单个对象，两者都要兼容。
+	var entries []apisixLogEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		var one apisixLogEntry
+		if err2 := json.Unmarshal(raw, &one); err2 != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		entries = []apisixLogEntry{one}
+	}
+	logs := make([]model.AccessLogEntry, 0, len(entries))
+	for _, e := range entries {
+		le := model.AccessLogEntry{
+			Method:    e.Request.Method,
+			Status:    e.Response.Status,
+			LatencyMS: e.Latency,
+			Consumer:  e.Consumer,
+			APIPath:   e.Request.URI,
+		}
+		// route_id 即控制面的 api.id，可回溯服务与原始路径。
+		if id, err := strconv.ParseInt(e.RouteID, 10, 64); err == nil {
+			if a, err := h.st.GetAPI(ctx, id); err == nil {
+				le.APIID = a.ID
+				le.ServiceID = a.ServiceID
+				le.APIPath = a.Path
+			}
+		}
+		logs = append(logs, le)
+	}
+	if err := h.st.InsertAccessLogs(ctx, logs); err != nil {
+		log.Printf("ingest access: %v", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ingested": len(logs)})
 }
 
 // ---------- helpers ----------

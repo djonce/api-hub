@@ -45,11 +45,32 @@ type API struct {
 	Group        string          `json:"group"`
 	ReqSchema    json.RawMessage `json:"req_schema,omitempty"`
 	RespSchema   json.RawMessage `json:"resp_schema,omitempty"`
-	AuthRequired bool            `json:"auth_required"`
-	RateLimit    int             `json:"rate_limit"`
-	ConnMode     *string         `json:"conn_mode,omitempty"`
-	Status       string          `json:"status"`
-	Source       string          `json:"source"`
+	AuthRequired   bool            `json:"auth_required"`
+	RateLimit      int             `json:"rate_limit"`
+	ConnMode       *string         `json:"conn_mode,omitempty"`
+	BreakerEnabled bool            `json:"breaker_enabled"`
+	Status         string          `json:"status"`
+	Source         string          `json:"source"`
+}
+
+// AccessLogEntry 一条访问日志（落库后用于统计）。
+type AccessLogEntry struct {
+	ServiceID int64
+	APIID     int64
+	APIPath   string
+	Method    string
+	Status    int
+	LatencyMS float64
+	Consumer  string
+}
+
+// AuditEntry 一条审计日志。
+type AuditEntry struct {
+	ID     int64     `json:"id"`
+	Action string    `json:"action"`
+	Target string    `json:"target"`
+	Detail string    `json:"detail"`
+	TS     time.Time `json:"ts"`
 }
 
 // Consumer 消费方
@@ -73,9 +94,10 @@ type APIKey struct {
 // ---- 注册请求/响应 ----
 
 type RegisterRequest struct {
-	Service  RegisterService  `json:"service"`
-	Instance RegisterInstance `json:"instance"`
-	APIs     []RegisterAPI    `json:"apis"`
+	Service     RegisterService  `json:"service"`
+	Instance    RegisterInstance `json:"instance"`
+	APIs        []RegisterAPI    `json:"apis"`
+	OpenAPISpec json.RawMessage  `json:"openapi_spec,omitempty"`
 }
 
 type RegisterService struct {
@@ -91,6 +113,9 @@ type RegisterService struct {
 type RegisterInstance struct {
 	InstanceUID string `json:"instance_uid"`
 	LocalPort   int    `json:"local_port"`
+	// AdvertiseHost 非空表示服务可被平台/网关直接访问（如同网段、容器编排内），
+	// 此时直连与中继上游用 AdvertiseHost:LocalPort，无需 frp 穿透。
+	AdvertiseHost string `json:"advertise_host,omitempty"`
 }
 
 type RegisterAPI struct {

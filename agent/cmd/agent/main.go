@@ -23,9 +23,10 @@ import (
 // ---- 与控制面对齐的报文结构 ----
 
 type registerReq struct {
-	Service  regService  `json:"service"`
-	Instance regInstance `json:"instance"`
-	APIs     []regAPI    `json:"apis"`
+	Service     regService      `json:"service"`
+	Instance    regInstance     `json:"instance"`
+	APIs        []regAPI        `json:"apis"`
+	OpenAPISpec json.RawMessage `json:"openapi_spec,omitempty"`
 }
 
 type regService struct {
@@ -39,8 +40,9 @@ type regService struct {
 }
 
 type regInstance struct {
-	InstanceUID string `json:"instance_uid"`
-	LocalPort   int    `json:"local_port"`
+	InstanceUID   string `json:"instance_uid"`
+	LocalPort     int    `json:"local_port"`
+	AdvertiseHost string `json:"advertise_host,omitempty"`
 }
 
 type regAPI struct {
@@ -67,17 +69,18 @@ type frp struct {
 }
 
 type config struct {
-	platformURL string
-	name        string
-	version     string
-	env         string
-	owner       string
-	connMode    string
-	localPort   string
-	healthPath  string
-	openapiURL  string
-	frpcBin     string
-	workDir     string
+	platformURL  string
+	name         string
+	version      string
+	env          string
+	owner        string
+	connMode     string
+	localPort    string
+	healthPath   string
+	openapiURL   string
+	frpcBin      string
+	workDir      string
+	advertiseHost string // 服务可直达地址（同网段/容器编排内），设置后免 frp
 }
 
 func env(k, def string) string {
@@ -100,6 +103,7 @@ func loadConfig() config {
 		openapiURL:  env("OPENAPI_URL", "http://localhost:9000/openapi.json"),
 		frpcBin:     env("FRPC_BIN", ""), // 留空则不拉起 frpc（本机联调场景）
 		workDir:     env("AGENT_WORKDIR", "."),
+		advertiseHost: env("SERVICE_HOST", ""), // 设置后免 frp，直接用该地址作上游
 	}
 }
 
@@ -108,12 +112,12 @@ func main() {
 	uid := instanceUID(cfg.name)
 	log.Printf("agent starting: service=%s uid=%s", cfg.name, uid)
 
-	apis, err := fetchOpenAPI(cfg.openapiURL)
+	apis, rawSpec, err := fetchOpenAPI(cfg.openapiURL)
 	if err != nil {
 		log.Printf("warn: fetch openapi failed (%v); registering with empty api list", err)
 	}
 
-	resp, err := register(cfg, uid, apis)
+	resp, err := register(cfg, uid, apis, rawSpec)
 	if err != nil {
 		log.Fatalf("register failed: %v", err)
 	}
@@ -159,21 +163,22 @@ func instanceUID(name string) string {
 	return fmt.Sprintf("%s-%s-%s", name, host, hex.EncodeToString(b))
 }
 
-// fetchOpenAPI 拉取本地服务的 OpenAPI 文档并解析出接口清单。
-func fetchOpenAPI(url string) ([]regAPI, error) {
+// fetchOpenAPI 拉取本地服务的 OpenAPI 文档：返回解析出的接口清单与原始文档字节。
+func fetchOpenAPI(url string) ([]regAPI, []byte, error) {
 	if url == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return parseOpenAPI(body)
+	apis, err := parseOpenAPI(body)
+	return apis, body, err
 }
 
 // parseOpenAPI 解析 OpenAPI 3.x 的 paths 段。
@@ -211,7 +216,7 @@ func parseOpenAPI(body []byte) ([]regAPI, error) {
 	return out, nil
 }
 
-func register(cfg config, uid string, apis []regAPI) (*registerResp, error) {
+func register(cfg config, uid string, apis []regAPI, rawSpec []byte) (*registerResp, error) {
 	lp := 0
 	fmt.Sscanf(cfg.localPort, "%d", &lp)
 	req := registerReq{
@@ -219,8 +224,9 @@ func register(cfg config, uid string, apis []regAPI) (*registerResp, error) {
 			Name: cfg.name, Version: cfg.version, Env: cfg.env, Owner: cfg.owner,
 			Tags: []string{}, ConnMode: cfg.connMode, HealthPath: cfg.healthPath,
 		},
-		Instance: regInstance{InstanceUID: uid, LocalPort: lp},
-		APIs:     apis,
+		Instance:    regInstance{InstanceUID: uid, LocalPort: lp, AdvertiseHost: cfg.advertiseHost},
+		APIs:        apis,
+		OpenAPISpec: json.RawMessage(rawSpec),
 	}
 	var out registerResp
 	if err := postJSON(cfg.platformURL+"/api/v1/register", req, &out); err != nil {

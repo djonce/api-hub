@@ -1,31 +1,40 @@
-# APISIX 数据面网关配置（最小可用）
+# APISIX 3.9 数据面网关配置
 # 控制面通过 Admin API (admin_key) 下发 route / upstream / consumer
 
 apisix:
   node_listen: 9080
   enable_admin: true
-  admin_key:
-    - name: admin
-      key: CHANGE_ME_APISIX_ADMIN_KEY
-      role: admin
+  # 解析 upstream / http-logger 中的容器服务名（Docker 内置 DNS）
+  dns_resolver:
+    - 127.0.0.11
 
 deployment:
   role: traditional
   role_traditional:
     config_provider: etcd
   admin:
+    admin_key:
+      - name: admin
+        key: apihub-admin-key
+        role: admin
     allow_admin:
       - 0.0.0.0/0
+    admin_listen:
+      ip: 0.0.0.0
+      port: 9180
   etcd:
     host:
       - "http://etcd:2379"
     prefix: /apisix
     timeout: 30
 
+# 我方路由会用到的插件，必须在此启用
 plugins:
+  - proxy-rewrite
   - key-auth
   - jwt-auth
   - limit-count
   - limit-req
-  - proxy-rewrite
+  - api-breaker
+  - http-logger
   - prometheus

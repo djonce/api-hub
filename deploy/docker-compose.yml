@@ -16,15 +16,20 @@ services:
       test: ["CMD-SHELL", "pg_isready -U apihub"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   etcd:
-    image: bitnami/etcd:3.5
+    image: quay.io/coreos/etcd:v3.5.21
     environment:
       ALLOW_NONE_AUTHENTICATION: "yes"
       ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
@@ -42,11 +47,72 @@ services:
       - "9080:9080"   # 数据面（中继入口）
       - "9180:9180"   # Admin API
 
+  # 控制面：注册中心 + 控制台 API
+  server:
+    build:
+      context: ../server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      LISTEN: ":8080"
+      PG_DSN: "postgres://apihub:apihub@postgres:5432/apihub?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      PUBLIC_HOST: "localhost"
+      APISIX_ADMIN: "http://apisix:9180"
+      APISIX_ADMIN_KEY: "apihub-admin-key"
+      APISIX_GATEWAY: "http://localhost:9080"
+      LOG_INGEST_URI: "http://server:8080/api/v1/ingest/access"
+      HEARTBEAT_SEC: "10"
+    ports:
+      - "8080:8080"
+    restart: on-failure
+
+  # 示例业务服务
+  demo-service:
+    build:
+      context: ../examples/demo-service
+    environment:
+      PORT: "9000"
+    ports:
+      - "9000:9000"
+
+  # Agent：随示例服务注册（compose 内可直达，SERVICE_HOST 免 frp）
+  agent:
+    build:
+      context: ../agent
+    depends_on:
+      - server
+      - demo-service
+    environment:
+      PLATFORM_URL: "http://server:8080"
+      SERVICE_NAME: "demo-service"
+      SERVICE_VERSION: "1.0.0"
+      SERVICE_ENV: "dev"
+      SERVICE_HOST: "demo-service"   # 平台/网关可直达地址 -> 免 frp
+      LOCAL_PORT: "9000"
+      OPENAPI_URL: "http://demo-service:9000/openapi.json"
+      CONN_MODE: "relay"
+    restart: on-failure
+
+  # 管理后台（nginx 反代 /api 到 server）
+  web:
+    build:
+      context: ../web
+    depends_on:
+      - server
+    ports:
+      - "8088:80"
+
+  # frps：仅在真实「无外网IP」场景需要，默认不启动。启用： docker compose --profile frp up
   frps:
     image: snowdreamtech/frps:latest
+    profiles: ["frp"]
     volumes:
       - ./frps/frps.toml:/etc/frp/frps.toml:ro
-    network_mode: host   # 需要开放 7000 + 40000-49999 端口段
+    network_mode: host
 
 volumes:
   pgdata:
