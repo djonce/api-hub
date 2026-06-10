@@ -2,7 +2,7 @@
 
 各业务服务启动时自动向平台注册，并同步可提供的接口（OpenAPI）；平台统一管理这些接口。服务可能无外网 IP，通过 **frp** 穿透，支持「直连」与「平台中继」两种调用方式。
 
-详细设计见 [`docs/design.md`](docs/design.md)。
+详细设计见 [`docs/design.md`](docs/design.md)；**服务端口、访问方式与本地启动/排错见 [`docs/operations.md`](docs/operations.md)**。
 
 ## 架构一览
 
