@@ -5,8 +5,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -109,7 +107,7 @@ func loadConfig() config {
 
 func main() {
 	cfg := loadConfig()
-	uid := instanceUID(cfg.name)
+	uid := instanceUID(cfg.name, cfg.localPort)
 	log.Printf("agent starting: service=%s uid=%s", cfg.name, uid)
 
 	apis, rawSpec, err := fetchOpenAPI(cfg.openapiURL)
@@ -156,11 +154,12 @@ func main() {
 	}
 }
 
-func instanceUID(name string) string {
+// instanceUID 基于 服务名+主机名+本地端口 生成稳定实例标识。
+// 同一服务在同一主机同一端口即同一实例：进程重启后 UID 不变，可复用已分配的 frp 端口，
+// 避免每次重启都新建实例行、泄漏 frp 端口。
+func instanceUID(name, port string) string {
 	host, _ := os.Hostname()
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%s-%s-%s", name, host, hex.EncodeToString(b))
+	return fmt.Sprintf("%s-%s-%s", name, host, port)
 }
 
 // fetchOpenAPI 拉取本地服务的 OpenAPI 文档：返回解析出的接口清单与原始文档字节。

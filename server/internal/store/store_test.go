@@ -86,6 +86,14 @@ func TestServiceAndInstanceFlow(t *testing.T) {
 		t.Fatalf("ListInstances 应有 1 个, got %d err=%v", len(insts), err)
 	}
 
+	// 反注册回收端口要用到：按 uid 查端口
+	if p, err := st.InstancePortByUID(ctx, "uid-1"); err != nil || p != 40001 {
+		t.Errorf("InstancePortByUID=%d err=%v, want 40001", p, err)
+	}
+	if p, err := st.InstancePortByUID(ctx, "no-such-uid"); err != nil || p != 0 {
+		t.Errorf("未知 uid 应返回 0, got %d err=%v", p, err)
+	}
+
 	// 在线状态
 	if err := st.MarkOnline(ctx, id, "uid-1", 30*time.Second); err != nil {
 		t.Fatal(err)

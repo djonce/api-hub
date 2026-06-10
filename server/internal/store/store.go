@@ -54,6 +54,16 @@ func (s *Store) ExistingInstancePort(ctx context.Context, serviceID int64, uid s
 	return port, proxy, err
 }
 
+// InstancePortByUID 返回某实例的 frp 远程端口（反注册时用于回收端口），不存在返回 0。
+func (s *Store) InstancePortByUID(ctx context.Context, uid string) (int, error) {
+	var port int
+	err := s.pg.QueryRow(ctx, `SELECT frp_remote_port FROM instance WHERE instance_uid=$1`, uid).Scan(&port)
+	if err == pgx.ErrNoRows {
+		return 0, nil
+	}
+	return port, err
+}
+
 // UpsertService 按 (name,version,env) 幂等写入，返回 service id。
 func (s *Store) UpsertService(ctx context.Context, rs model.RegisterService) (int64, error) {
 	if rs.ConnMode == "" {

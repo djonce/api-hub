@@ -181,8 +181,13 @@ func (h *Handler) deregister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	_ = h.st.Deregister(r.Context(), body.InstanceUID)
-	h.st.InsertAudit(r.Context(), "service.deregister", body.InstanceUID, "")
+	ctx := r.Context()
+	// 回收该实例占用的 frp 远程端口，避免端口随实例下线而泄漏、最终耗尽分配区间。
+	if port, err := h.st.InstancePortByUID(ctx, body.InstanceUID); err == nil && port > 0 {
+		_ = h.alloc.Release(ctx, port)
+	}
+	_ = h.st.Deregister(ctx, body.InstanceUID)
+	h.st.InsertAudit(ctx, "service.deregister", body.InstanceUID, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
