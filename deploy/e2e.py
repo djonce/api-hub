@@ -18,16 +18,23 @@ import urllib.request
 
 BASE = os.environ.get("BASE", "http://localhost:8080").rstrip("/")
 GATEWAY = os.environ.get("GATEWAY", "http://localhost:9080").rstrip("/")
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "wangjie")
 
 OK = "\033[32mPASS\033[0m"
 NO = "\033[31mFAIL\033[0m"
 WARN = "\033[33mWARN\033[0m"
+
+# 登录后签发的会话 token；管理类接口需带 Authorization: Bearer。
+TOKEN = ""
 
 
 def req(method, url, body=None, timeout=5):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method)
     r.add_header("Content-Type", "application/json")
+    if TOKEN:
+        r.add_header("Authorization", f"Bearer {TOKEN}")
     with urllib.request.urlopen(r, timeout=timeout) as resp:
         raw = resp.read().decode()
         if not raw:
@@ -67,6 +74,24 @@ print(f"控制面 BASE={BASE}  网关 GATEWAY={GATEWAY}\n[1] 等待服务就绪"
 
 if not wait("控制面 /healthz 可用", lambda: req("GET", f"{BASE}/healthz")[0] == 200):
     sys.exit(1)
+
+# 登录拿 token（管理类接口已鉴权）
+try:
+    st, body = req("POST", f"{BASE}/api/v1/login", {"username": ADMIN_USER, "password": ADMIN_PASS})
+    TOKEN = (body or {}).get("token", "")
+except Exception as e:
+    print(f"  {NO}  登录失败: {e}")
+    sys.exit(1)
+check(f"管理员登录成功（{ADMIN_USER}）", bool(TOKEN))
+# 顺带校验鉴权确实生效：去掉 token 访问管理接口应 401
+try:
+    _saved, TOKEN = TOKEN, ""
+    code = req("GET", f"{BASE}/api/v1/services")[0]
+    check("未携带 token 访问管理接口被拒（401）", code == 401)
+except urllib.error.HTTPError as e:
+    check("未携带 token 访问管理接口被拒（401）", e.code == 401)
+finally:
+    TOKEN = _saved
 
 
 def demo_registered():
