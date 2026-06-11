@@ -51,6 +51,8 @@ services:
   server:
     build:
       context: ../server
+      args:
+        APK_MIRROR: ${APK_MIRROR:-}   # 设为 mirrors.aliyun.com 等可加速 Alpine apk
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,6 +85,8 @@ services:
   agent:
     build:
       context: ../agent
+      args:
+        APK_MIRROR: ${APK_MIRROR:-}
     depends_on:
       - server
       - demo-service

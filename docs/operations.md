@@ -241,7 +241,18 @@ Go 测试分两类：
 
 3. **npm 依赖 → `NPM_REGISTRY`**：`web/Dockerfile` 已内置 `ARG NPM_REGISTRY=https://registry.npmmirror.com`。改回官方：`--build-arg NPM_REGISTRY=https://registry.npmjs.org`。
 
+4. **Alpine apk → `APK_MIRROR`**：`server`/`agent` 镜像装 `git`/`ca-certificates` 默认走 `dl-cdn.alpinelinux.org`（国内很慢，常数分钟）。两个 `Dockerfile` 内置 `ARG APK_MIRROR=`（留空走官方），传入即换源：
+   ```bash
+   # compose 全量构建（compose 已把 APK_MIRROR 透传给 server/agent）
+   APK_MIRROR=mirrors.aliyun.com docker compose build
+   # 单独 buildx 构建
+   docker buildx build --build-arg APK_MIRROR=mirrors.aliyun.com -t api-hub-agent ./agent
+   ```
+   实测换源后 `apk add git` 由数分钟降到约 6 秒。
+
 > 配好镜像源后，全量构建（含编译 Go 三个服务 + 构建前端 + 拉 PG/Redis/etcd/APISIX）几分钟内即可完成，`python3 e2e.py` 应全绿。
+>
+> **小内存机器（如 1～2G）**：别在机器上一边跑栈一边 `--build`（易 OOM/swap 卡死）。要么先 `docker compose down` 腾内存再构建，要么在本机交叉编译后传镜像：`docker buildx build --platform linux/amd64 ... --load` → `docker save 镜像 | ssh 主机 'docker load'` → `docker compose up -d --no-build`。
 
 ## 9. 已知注意事项
 
