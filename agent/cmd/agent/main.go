@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -105,6 +107,18 @@ func loadConfig() config {
 	}
 }
 
+// runtime 持有 Agent 运行期可变状态，使心跳协程能在控制面侧实例丢失时自愈（重注册 + 必要时重启 frpc）。
+type runtime struct {
+	cfg     config
+	uid     string
+	apis    []regAPI
+	rawSpec []byte
+
+	mu         sync.Mutex
+	frpcCmd    *exec.Cmd
+	remotePort int
+}
+
 func main() {
 	cfg := loadConfig()
 	uid := instanceUID(cfg.name, cfg.localPort)
@@ -114,6 +128,7 @@ func main() {
 	if err != nil {
 		log.Printf("warn: fetch openapi failed (%v); registering with empty api list", err)
 	}
+	rt := &runtime{cfg: cfg, uid: uid, apis: apis, rawSpec: rawSpec}
 
 	resp, err := register(cfg, uid, apis, rawSpec)
 	if err != nil {
@@ -122,10 +137,8 @@ func main() {
 	log.Printf("registered: service_id=%d remote_port=%d proxy=%s", resp.ServiceID, resp.FRP.RemotePort, resp.FRP.ProxyName)
 
 	// 拉起 frpc（穿透）
-	var frpcCmd *exec.Cmd
 	if cfg.frpcBin != "" {
-		frpcCmd, err = startFRPC(cfg, resp.FRP)
-		if err != nil {
+		if err := rt.startFRPC(resp.FRP); err != nil {
 			log.Printf("warn: start frpc failed: %v", err)
 		} else {
 			log.Printf("frpc started, tunneling local:%s -> frps remote:%d", cfg.localPort, resp.FRP.RemotePort)
@@ -140,7 +153,7 @@ func main() {
 		interval = 10 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	go heartbeatLoop(ctx, cfg, uid, interval)
+	go rt.heartbeatLoop(ctx, interval)
 
 	// 等待退出信号
 	sig := make(chan os.Signal, 1)
@@ -149,9 +162,7 @@ func main() {
 	log.Printf("shutting down...")
 	cancel()
 	deregister(cfg, uid)
-	if frpcCmd != nil && frpcCmd.Process != nil {
-		_ = frpcCmd.Process.Kill()
-	}
+	rt.stopFRPC()
 }
 
 // instanceUID 基于 服务名+主机名+本地端口 生成稳定实例标识。
@@ -241,7 +252,7 @@ func register(cfg config, uid string, apis []regAPI, rawSpec []byte) (*registerR
 	return &out, nil
 }
 
-func heartbeatLoop(ctx context.Context, cfg config, uid string, interval time.Duration) {
+func (rt *runtime) heartbeatLoop(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -249,9 +260,43 @@ func heartbeatLoop(ctx context.Context, cfg config, uid string, interval time.Du
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := postJSON(cfg.platformURL+"/api/v1/heartbeat", map[string]string{"instance_uid": uid}, nil); err != nil {
+			err := postJSON(rt.cfg.platformURL+"/api/v1/heartbeat", map[string]string{"instance_uid": rt.uid}, nil)
+			if err == nil {
+				continue
+			}
+			// 控制面侧实例已不存在（如控制面重启 + Redis 在线态过期）会返回 404；
+			// 此时自动重新注册以自愈，而非永久报错。
+			var he *httpStatusError
+			if errors.As(err, &he) && he.code == http.StatusNotFound {
+				log.Printf("heartbeat: 实例在控制面已丢失，尝试重新注册...")
+				rt.reregister()
+			} else {
 				log.Printf("heartbeat error: %v", err)
 			}
+		}
+	}
+}
+
+// reregister 重新注册当前实例；若使用 frp 且分配到的远程端口变化，则重启 frpc 以保持隧道一致。
+func (rt *runtime) reregister() {
+	resp, err := register(rt.cfg, rt.uid, rt.apis, rt.rawSpec)
+	if err != nil {
+		log.Printf("re-register failed: %v", err)
+		return
+	}
+	log.Printf("re-registered: service_id=%d remote_port=%d", resp.ServiceID, resp.FRP.RemotePort)
+	if rt.cfg.frpcBin == "" {
+		return
+	}
+	rt.mu.Lock()
+	needRestart := rt.frpcCmd == nil || resp.FRP.RemotePort != rt.remotePort
+	rt.mu.Unlock()
+	if needRestart {
+		rt.stopFRPC()
+		if err := rt.startFRPC(resp.FRP); err != nil {
+			log.Printf("warn: restart frpc failed: %v", err)
+		} else {
+			log.Printf("frpc restarted, tunneling local:%s -> frps remote:%d", rt.cfg.localPort, resp.FRP.RemotePort)
 		}
 	}
 }
@@ -262,8 +307,32 @@ func deregister(cfg config, uid string) {
 	}
 }
 
-// startFRPC 生成 frpc 配置并拉起 frpc 进程。
-func startFRPC(cfg config, f frp) (*exec.Cmd, error) {
+// startFRPC 生成 frpc 配置并拉起 frpc 进程，记录当前进程与远程端口（供重启/退出时管理）。
+func (rt *runtime) startFRPC(f frp) error {
+	cmd, err := buildFRPC(rt.cfg, f)
+	if err != nil {
+		return err
+	}
+	rt.mu.Lock()
+	rt.frpcCmd = cmd
+	rt.remotePort = f.RemotePort
+	rt.mu.Unlock()
+	return nil
+}
+
+// stopFRPC 终止当前 frpc 进程（若有）。
+func (rt *runtime) stopFRPC() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.frpcCmd != nil && rt.frpcCmd.Process != nil {
+		_ = rt.frpcCmd.Process.Kill()
+		_ = rt.frpcCmd.Wait()
+	}
+	rt.frpcCmd = nil
+}
+
+// buildFRPC 写出 frpc 配置并启动进程。
+func buildFRPC(cfg config, f frp) (*exec.Cmd, error) {
 	lp := cfg.localPort
 	conf := fmt.Sprintf(`serverAddr = "%s"
 serverPort = %d
@@ -291,6 +360,17 @@ remotePort = %d
 	return cmd, nil
 }
 
+// httpStatusError 携带 HTTP 状态码，便于调用方按状态分支处理（如心跳 404 触发重注册）。
+type httpStatusError struct {
+	url  string
+	code int
+	body string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s -> %d: %s", e.url, e.code, e.body)
+}
+
 func postJSON(url string, in any, out any) error {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(in); err != nil {
@@ -303,7 +383,7 @@ func postJSON(url string, in any, out any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%s -> %d: %s", url, resp.StatusCode, string(b))
+		return &httpStatusError{url: url, code: resp.StatusCode, body: string(b)}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
