@@ -296,6 +296,29 @@ func TestAudit(t *testing.T) {
 	}
 }
 
+func TestSession(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	if err := st.CreateSession(ctx, "tok-1", "admin", time.Minute); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if u, err := st.SessionUser(ctx, "tok-1"); err != nil || u != "admin" {
+		t.Errorf("SessionUser=%q err=%v, want admin", u, err)
+	}
+	// 未知 token 返回空
+	if u, err := st.SessionUser(ctx, "nope"); err != nil || u != "" {
+		t.Errorf("未知 token 应返回空, got %q err=%v", u, err)
+	}
+	// 删除后失效
+	if err := st.DeleteSession(ctx, "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := st.SessionUser(ctx, "tok-1"); u != "" {
+		t.Errorf("删除后应失效, got %q", u)
+	}
+}
+
 func TestStatsOverview(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

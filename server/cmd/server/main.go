@@ -50,6 +50,8 @@ func main() {
 		HeartbeatSec:  atoi(env("HEARTBEAT_SEC", "10")),
 		PublicHost:    env("PUBLIC_HOST", "127.0.0.1"),
 		GatewayURL:    env("APISIX_GATEWAY", "http://127.0.0.1:9080"),
+		AdminUser:     env("ADMIN_USER", "admin"),
+		AdminPass:     env("ADMIN_PASS", "wangjie"),
 	}
 
 	h := api.New(st, alloc, ax, cfg)

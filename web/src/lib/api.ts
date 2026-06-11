@@ -2,6 +2,17 @@
 
 const BASE = "/api/v1";
 
+// ---- 登录态：token 存 localStorage ----
+const TOKEN_KEY = "apihub_token";
+export const getToken = () => localStorage.getItem(TOKEN_KEY) || "";
+export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t);
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+export const isAuthed = () => !!getToken();
+
+// 登录态变化（登录/登出/会话过期）时广播，App 据此切换登录页/后台。
+export const AUTH_EVENT = "apihub-auth-changed";
+const notifyAuthChanged = () => window.dispatchEvent(new Event(AUTH_EVENT));
+
 export interface Service {
   id: number;
   name: string;
@@ -105,10 +116,21 @@ export interface AuditEntry {
 export const openapiUrl = (serviceId: number) => `${BASE}/services/${serviceId}/openapi`;
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getToken();
   const resp = await fetch(BASE + path, {
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers || {}),
+    },
   });
+  if (resp.status === 401) {
+    // 未登录/会话过期：清除 token 并通知 App 跳登录页。
+    clearToken();
+    notifyAuthChanged();
+    throw new Error("未登录或登录已过期");
+  }
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`${resp.status}: ${text}`);
@@ -118,6 +140,28 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // 登录态
+  login: async (username: string, password: string) => {
+    const r = await req<{ token: string; username: string }>("/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    setToken(r.token);
+    notifyAuthChanged();
+    return r;
+  },
+  logout: async () => {
+    try {
+      await req<{ ok: boolean }>("/logout", { method: "POST" });
+    } catch {
+      /* 忽略：本地清 token 即可 */
+    }
+    clearToken();
+    notifyAuthChanged();
+  },
+  me: () => req<{ username: string }>("/me"),
+  // OpenAPI 文档（受登录保护，取回文档对象交给 Swagger UI 渲染）
+  openapi: (id: number) => req<Record<string, unknown>>(`/services/${id}/openapi`),
   config: () => req<AppConfig>("/config"),
   overview: () => req<Overview>("/stats/overview"),
   callStats: (hours = 24, serviceId?: number) =>

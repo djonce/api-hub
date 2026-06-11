@@ -1,4 +1,5 @@
-import { Layout, Menu } from "antd";
+import { useEffect, useState } from "react";
+import { Layout, Menu, Button } from "antd";
 import {
   ApiOutlined,
   AppstoreOutlined,
@@ -6,6 +7,7 @@ import {
   DashboardOutlined,
   LineChartOutlined,
   FileSearchOutlined,
+  LogoutOutlined,
 } from "@ant-design/icons";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import Overview from "./pages/Overview";
@@ -15,10 +17,25 @@ import ApiDocs from "./pages/ApiDocs";
 import Consumers from "./pages/Consumers";
 import Monitoring from "./pages/Monitoring";
 import Audit from "./pages/Audit";
+import Login from "./pages/Login";
+import { api, isAuthed, AUTH_EVENT } from "./lib/api";
 
 const { Header, Sider, Content } = Layout;
 
+// 登录门：未登录显示登录页；登录态变化（登录/登出/会话过期）时自动切换。
 export default function App() {
+  const [authed, setAuthed] = useState(isAuthed());
+  useEffect(() => {
+    const onChange = () => setAuthed(isAuthed());
+    window.addEventListener(AUTH_EVENT, onChange);
+    return () => window.removeEventListener(AUTH_EVENT, onChange);
+  }, []);
+
+  if (!authed) return <Login />;
+  return <AdminLayout />;
+}
+
+function AdminLayout() {
   const loc = useLocation();
   const selected = loc.pathname.startsWith("/services")
     ? "services"
@@ -50,7 +67,22 @@ export default function App() {
         />
       </Sider>
       <Layout>
-        <Header style={{ background: "#fff", paddingLeft: 24, fontWeight: 600 }}>管理后台</Header>
+        <Header
+          style={{
+            background: "#fff",
+            paddingLeft: 24,
+            paddingRight: 24,
+            fontWeight: 600,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <span>管理后台</span>
+          <Button type="text" icon={<LogoutOutlined />} onClick={() => api.logout()}>
+            退出登录
+          </Button>
+        </Header>
         <Content style={{ margin: 24 }}>
           <Routes>
             <Route path="/" element={<Overview />} />

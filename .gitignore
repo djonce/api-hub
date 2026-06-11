@@ -19,3 +19,6 @@ __pycache__/
 # 环境
 .env
 .DS_Store
+
+# 编辑器/工具本地配置
+.claude/

@@ -95,7 +95,9 @@ npm install
 npm run dev   # http://localhost:5173 （已代理 /api -> :8080）
 ```
 
-打开后台即可看到自动注册上来的 `demo-service`：服务详情页展示其**运行实例**（在线状态、直连地址、frp 端口）与**接口列表**（可逐接口上下线、切换直连/中继模式），点「查看接口文档」可打开内嵌 **Swagger UI**（直连模式下的 try-it-out 会直接打到服务的直连地址）。
+打开后台先**登录**（默认账号 `admin` / 密码 `wangjie`，可用控制面环境变量 `ADMIN_USER` / `ADMIN_PASS` 覆盖）。登录后即可看到自动注册上来的 `demo-service`：服务详情页展示其**运行实例**（在线状态、直连地址、frp 端口）与**接口列表**（可逐接口上下线、切换直连/中继模式），点「查看接口文档」可打开内嵌 **Swagger UI**（直连模式下的 try-it-out 会直接打到服务的直连地址）。
+
+> 登录态：控制面 `POST /api/v1/login` 校验后签发会话 token（存 Redis，24h）；管理类接口需带 `Authorization: Bearer <token>`，Agent 注册/心跳与网关日志上报不受影响。
 
 > 一期已具备：自动注册 / 心跳 / 反注册、OpenAPI 同步与文档查看、接口上下线、实例在线状态、直连模式可用。
 

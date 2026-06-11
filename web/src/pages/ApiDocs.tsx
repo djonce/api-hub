@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Card, Alert, Spin } from "antd";
 import { Link, useParams } from "react-router-dom";
-import { openapiUrl } from "../lib/api";
+import { api } from "../lib/api";
 
 const SWAGGER_VERSION = "5.17.14";
 const CSS = `https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/${SWAGGER_VERSION}/swagger-ui.min.css`;
@@ -36,8 +36,9 @@ export default function ApiDocs() {
   useEffect(() => {
     let cancelled = false;
     loadCss(CSS);
-    loadScript(JS)
-      .then(() => {
+    // 文档接口已受登录保护，这里用带 token 的客户端取回文档对象，再交给 Swagger 渲染。
+    Promise.all([loadScript(JS), api.openapi(sid)])
+      .then(([, spec]) => {
         if (cancelled || !ref.current) return;
         const SwaggerUIBundle = (window as unknown as { SwaggerUIBundle?: any }).SwaggerUIBundle;
         if (!SwaggerUIBundle) {
@@ -45,7 +46,7 @@ export default function ApiDocs() {
           return;
         }
         SwaggerUIBundle({
-          url: openapiUrl(sid),
+          spec,
           domNode: ref.current,
           deepLinking: true,
           presets: [SwaggerUIBundle.presets.apis],

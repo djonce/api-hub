@@ -32,6 +32,15 @@ func newAPIKey() string {
 	return "ak_" + hex.EncodeToString(b)
 }
 
+// newSessionToken 生成管理后台登录会话 token。
+func newSessionToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
 // apisixUsername 由消费方名与 Key ID 组成 APISIX consumer 用户名。
 // APISIX 用户名只允许字母/数字/下划线，故对名称做清洗；附加 Key ID 以支持一个消费方多把 Key。
 func apisixUsername(name string, keyID int64) string {

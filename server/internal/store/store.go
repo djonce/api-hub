@@ -39,6 +39,29 @@ func (s *Store) Close() {
 
 func (s *Store) Redis() *redis.Client { return s.rdb }
 
+// ---------- 管理后台会话（Redis，登录态）----------
+
+func sessionKey(token string) string { return "auth:session:" + token }
+
+// CreateSession 登录成功后写入会话，token -> 用户名，带 TTL。
+func (s *Store) CreateSession(ctx context.Context, token, user string, ttl time.Duration) error {
+	return s.rdb.Set(ctx, sessionKey(token), user, ttl).Err()
+}
+
+// SessionUser 返回 token 对应的登录用户名；token 无效/过期返回空串。
+func (s *Store) SessionUser(ctx context.Context, token string) (string, error) {
+	u, err := s.rdb.Get(ctx, sessionKey(token)).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return u, err
+}
+
+// DeleteSession 注销时删除会话。
+func (s *Store) DeleteSession(ctx context.Context, token string) error {
+	return s.rdb.Del(ctx, sessionKey(token)).Err()
+}
+
 // ---------- 注册相关 ----------
 
 // ExistingInstancePort 返回该实例已分配的 frp 端口（用于重注册时复用），不存在返回 0。

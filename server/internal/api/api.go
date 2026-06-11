@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/api-hub/server/internal/apisix"
@@ -23,6 +25,8 @@ type Config struct {
 	HeartbeatSec  int
 	PublicHost    string // 平台公网/可达主机，用于拼直连URL与中继上游
 	GatewayURL    string // APISIX 数据面对外地址，如 http://host:9080，用于拼中继入口
+	AdminUser     string // 管理后台登录账号
+	AdminPass     string // 管理后台登录密码
 }
 
 type Handler struct {
@@ -39,29 +43,34 @@ func New(st *store.Store, alloc *frpalloc.Allocator, ax *apisix.Client, cfg Conf
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// Agent <-> 注册中心
+	// 登录 / 鉴权（公开）
+	mux.HandleFunc("POST /api/v1/login", h.login)
+	mux.HandleFunc("POST /api/v1/logout", h.logout)
+	mux.HandleFunc("GET /api/v1/me", h.auth(h.me))
+
+	// Agent <-> 注册中心（机器调用，不走登录态）
 	mux.HandleFunc("POST /api/v1/register", h.register)
 	mux.HandleFunc("POST /api/v1/heartbeat", h.heartbeat)
 	mux.HandleFunc("POST /api/v1/deregister", h.deregister)
 
-	// 控制台
-	mux.HandleFunc("GET /api/v1/services", h.listServices)
-	mux.HandleFunc("GET /api/v1/services/{id}", h.getService)
-	mux.HandleFunc("GET /api/v1/services/{id}/apis", h.listAPIs)
-	mux.HandleFunc("GET /api/v1/services/{id}/instances", h.listInstances)
-	mux.HandleFunc("GET /api/v1/services/{id}/openapi", h.getOpenAPI)
-	mux.HandleFunc("POST /api/v1/services/{id}/sync", h.syncService)
-	mux.HandleFunc("PATCH /api/v1/apis/{id}", h.patchAPI)
-	mux.HandleFunc("GET /api/v1/config", h.getConfig)
-	mux.HandleFunc("GET /api/v1/consumers", h.listConsumers)
-	mux.HandleFunc("POST /api/v1/consumers", h.createConsumer)
-	mux.HandleFunc("POST /api/v1/consumers/{id}/keys", h.createKey)
-	mux.HandleFunc("GET /api/v1/stats/overview", h.overview)
+	// 控制台（均需登录）
+	mux.HandleFunc("GET /api/v1/services", h.auth(h.listServices))
+	mux.HandleFunc("GET /api/v1/services/{id}", h.auth(h.getService))
+	mux.HandleFunc("GET /api/v1/services/{id}/apis", h.auth(h.listAPIs))
+	mux.HandleFunc("GET /api/v1/services/{id}/instances", h.auth(h.listInstances))
+	mux.HandleFunc("GET /api/v1/services/{id}/openapi", h.auth(h.getOpenAPI))
+	mux.HandleFunc("POST /api/v1/services/{id}/sync", h.auth(h.syncService))
+	mux.HandleFunc("PATCH /api/v1/apis/{id}", h.auth(h.patchAPI))
+	mux.HandleFunc("GET /api/v1/config", h.auth(h.getConfig))
+	mux.HandleFunc("GET /api/v1/consumers", h.auth(h.listConsumers))
+	mux.HandleFunc("POST /api/v1/consumers", h.auth(h.createConsumer))
+	mux.HandleFunc("POST /api/v1/consumers/{id}/keys", h.auth(h.createKey))
+	mux.HandleFunc("GET /api/v1/stats/overview", h.auth(h.overview))
 
-	// 三期：监控 / 审计
-	mux.HandleFunc("GET /api/v1/stats/calls", h.callStats)
-	mux.HandleFunc("GET /api/v1/audit", h.listAudit)
-	// 数据面访问日志接入（APISIX http-logger 推送，内网调用）
+	// 三期：监控 / 审计（需登录）
+	mux.HandleFunc("GET /api/v1/stats/calls", h.auth(h.callStats))
+	mux.HandleFunc("GET /api/v1/audit", h.auth(h.listAudit))
+	// 数据面访问日志接入（APISIX http-logger 推送，内网调用，不走登录态）
 	mux.HandleFunc("POST /api/v1/ingest/access", h.ingestAccess)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
@@ -562,6 +571,79 @@ func (h *Handler) ingestAccess(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ingest access: %v", err)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ingested": len(logs)})
+}
+
+// ---------- 登录 / 鉴权 ----------
+
+const sessionTTL = 24 * time.Hour
+
+// bearerToken 从 Authorization: Bearer <token> 头取出 token。
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if after, ok := strings.CutPrefix(h, "Bearer "); ok {
+		return strings.TrimSpace(after)
+	}
+	return ""
+}
+
+// login 校验管理员账号密码，成功则签发会话 token。
+func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// 常量时间比较，避免计时侧信道。
+	userOK := subtle.ConstantTimeCompare([]byte(body.Username), []byte(h.cfg.AdminUser)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(body.Password), []byte(h.cfg.AdminPass)) == 1
+	if !userOK || !passOK {
+		writeErr(w, http.StatusUnauthorized, fmt.Errorf("用户名或密码错误"))
+		return
+	}
+	token := newSessionToken()
+	if err := h.st.CreateSession(r.Context(), token, body.Username, sessionTTL); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": token, "username": body.Username})
+}
+
+// logout 注销当前会话（删除 token）。
+func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+	if tok := bearerToken(r); tok != "" {
+		_ = h.st.DeleteSession(r.Context(), tok)
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// me 返回当前登录用户（经 auth 中间件保护，用户名必非空）。
+func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
+	user, _ := h.st.SessionUser(r.Context(), bearerToken(r))
+	writeJSON(w, http.StatusOK, map[string]string{"username": user})
+}
+
+// auth 中间件：要求请求携带有效会话 token，否则 401。
+func (h *Handler) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok := bearerToken(r)
+		if tok == "" {
+			writeErr(w, http.StatusUnauthorized, fmt.Errorf("未登录"))
+			return
+		}
+		user, err := h.st.SessionUser(r.Context(), tok)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if user == "" {
+			writeErr(w, http.StatusUnauthorized, fmt.Errorf("登录已过期，请重新登录"))
+			return
+		}
+		next(w, r)
+	}
 }
 
 // ---------- helpers ----------
